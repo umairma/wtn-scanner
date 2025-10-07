@@ -1,101 +1,73 @@
-// api/scan.js — Vercel serverless function (no deps)
+// wtn-scanner/api/scan.js — Free scanner using OpenStreetMap Overpass (no keys)
+const OVERPASS = "https://overpass-api.de/api/interpreter";
 export default async function handler(req, res) {
+  res.setHeader("Access-Control-Allow-Origin","*");
+  res.setHeader("Access-Control-Allow-Methods","GET,OPTIONS");
+  res.setHeader("Access-Control-Allow-Headers","Content-Type");
+  if (req.method==="OPTIONS") return res.status(204).end();
+
+  const { lat, lng, radius_km="25" } = req.query || {};
+  const la = parseFloat(lat), lo = parseFloat(lng), rKm = Math.max(1, Math.min(50, parseFloat(radius_km)||25));
+  if (!isFinite(la)||!isFinite(lo)) return res.status(400).json({error:"lat,lng required"});
+
+  const r = Math.round(rKm*1000);
+  const q = `
+    [out:json][timeout:25];
+    (
+      node[amenity=food_bank](around:${r},${la},${lo});
+      node[social_facility=shelter](around:${r},${la},${lo});
+      node[office=charity](around:${r},${la},${lo});
+      node[amenity~"clinic|hospital|doctors"](around:${r},${la},${lo});
+      node[amenity~"animal_shelter|veterinary"](around:${r},${la},${lo});
+      way[office=charity](around:${r},${la},${lo});
+      relation[office=charity](around:${r},${la},${lo});
+    );
+    out center tags 200;
+  `;
   try {
-    const { lat, lng, radius_km = "25", q = "", category = "" } = req.query || {};
-    const latN = parseFloat(lat), lngN = parseFloat(lng), rKm = parseFloat(radius_km);
-    if (Number.isNaN(latN) || Number.isNaN(lngN)) {
-      return res.status(400).json({ error: "lat,lng required" });
-    }
+    const data = await fetch(OVERPASS, {
+      method:"POST",
+      headers:{ "content-type":"application/x-www-form-urlencoded; charset=UTF-8",
+                "user-agent":"WhatTheNeed-Scanner/1.0" },
+      body:new URLSearchParams({data:q})
+    }).then(r=>r.json());
 
-    const tasks = [
-      googlePlaces({ lat: latN, lng: lngN, radiusKm: rKm, q, category }),
-      charityNavigator({ q }),
-      propublicaIRS({ q })
-    ];
+    const items = (data.elements||[]).map(el => {
+      const t = el.tags||{};
+      const lat = el.lat ?? el.center?.lat, lng = el.lon ?? el.center?.lon;
+      const line1 = [t["addr:housenumber"], t["addr:street"]].filter(Boolean).join(" ");
+      const line2 = [t["addr:city"], t["addr:state"], t["addr:postcode"]].filter(Boolean).join(", ");
+      const addr = t["addr:full"] || [line1, line2].filter(Boolean).join(line1 && line2 ? ", " : "");
+      return {
+        id:`osm_${el.type}_${el.id}`,
+        name: t.name || t.operator || "Unknown organization",
+        address: addr || "",
+        lat, lng,
+        categories: guessCats(t),
+        website: t.website || t["contact:website"] || t.url || "",
+        donation_url: t.website || "",
+        verified:false, source:"osm"
+      };
+    }).filter(x=>isFinite(x.lat)&&isFinite(x.lng));
 
-    const settled = await Promise.allSettled(tasks);
-    const rows = settled.flatMap(r => r.status === "fulfilled" ? r.value : []);
-
-    const items = dedupe(rows).slice(0, 150);
-    res.setHeader('Access-Control-Allow-Origin', '*'); // simple CORS
-    return res.json({ results: items, count: items.length });
+    res.json({ results: dedupe(items).slice(0,150), count: items.length, source:"overpass", radius_km:rKm });
   } catch (e) {
-    console.error(e);
-    return res.status(500).json({ error: "scan_failed" });
+    console.error(e); res.status(500).json({error:"scan_failed"});
   }
 }
-
-async function googlePlaces({ lat, lng, radiusKm, q, category }) {
-  const KEY = process.env.GMAPS_KEY;
-  if (!KEY) return [];
-  const keyword = (q || category || "nonprofit").slice(0, 60);
-  const meters = Math.min(Math.round(radiusKm * 1000), 50000);
-  const url = `https://maps.googleapis.com/maps/api/place/nearbysearch/json?location=${lat},${lng}&radius=${meters}&keyword=${encodeURIComponent(keyword)}&key=${KEY}`;
-  const data = await (await fetch(url)).json();
-  return (data.results || []).map(r => ({
-    id: `g_${r.place_id}`,
-    name: r.name,
-    address: r.vicinity || r.formatted_address || "",
-    lat: r.geometry?.location?.lat,
-    lng: r.geometry?.location?.lng,
-    categories: guessCats(r.types),
-    website: "",
-    donation_url: "",
-    verified: false,
-    source: "google"
-  })).filter(x => isFinite(x.lat) && isFinite(x.lng));
+function guessCats(t){
+  const n=(t.name||"").toLowerCase();
+  const has=(k,v)=>t[k]===v;
+  const out=[];
+  if (has("amenity","food_bank")||/soup|pantry/.test(n)) out.push("Food Bank");
+  if (t.social_facility==="shelter"||/shelter|homeless/.test(n)) out.push("Shelter");
+  if (/clinic|hospital|doctor/.test(t.amenity||"")) out.push("Health");
+  if (/animal_shelter|veterinary/.test(t.amenity||"")) out.push("Animals");
+  if (has("office","charity")||has("amenity","community_centre")) out.push("Nonprofit");
+  return out.length?out:["Nonprofit"];
 }
-
-async function charityNavigator({ q }) {
-  const KEY = process.env.CN_KEY, ID = process.env.CN_ID;
-  if (!KEY || !ID || !q) return [];
-  const url = `https://api.charitynavigator.org/v2/Organizations?app_id=${ID}&app_key=${KEY}&pageSize=50&search=${encodeURIComponent(q)}`;
-  const data = await (await fetch(url)).json();
-  return (data || []).map(row => ({
-    id: `cn_${row.ein || row.charityNavigatorURL || Math.random().toString(36).slice(2)}`,
-    name: row.charityName || row.legalName,
-    address: [
-      row.mailingAddress?.streetAddress1, row.mailingAddress?.city,
-      row.mailingAddress?.stateOrProvince, row.mailingAddress?.postalCode
-    ].filter(Boolean).join(", "),
-    lat: row.latitude, lng: row.longitude,
-    categories: [row.category?.categoryName].filter(Boolean),
-    website: row.websiteURL || "",
-    donation_url: row.donationUrl || row.websiteURL || "",
-    verified: true,
-    source: "charitynavigator"
-  })).filter(x => isFinite(x.lat) && isFinite(x.lng));
-}
-
-async function propublicaIRS({ q }) {
-  const KEY = process.env.PP_API_KEY;
-  if (!KEY || !q) return [];
-  const url = `https://projects.propublica.org/nonprofits/api/v2/search.json?q=${encodeURIComponent(q)}`;
-  const data = await (await fetch(url, { headers: { "X-API-Key": KEY } })).json();
-  return ((data || {}).organizations || []).map(r => ({
-    id: `pp_${r.ein}`,
-    name: r.name,
-    address: [r.city, r.state].filter(Boolean).join(", "),
-    lat: NaN, lng: NaN,
-    categories: ["Nonprofit"],
-    website: "", donation_url: "",
-    verified: false,
-    source: "propublica"
-  })).filter(x => isFinite(x.lat) && isFinite(x.lng));
-}
-
-function guessCats(types = []) {
-  const set = new Set(types);
-  if (set.has("food_bank") || set.has("food")) return ["Food Bank"];
-  if (set.has("place_of_worship") || set.has("church")) return ["Community"];
-  if (set.has("health") || set.has("doctor") || set.has("hospital")) return ["Health"];
-  return ["Nonprofit"];
-}
-function dedupe(items) {
-  const map = new Map();
-  for (const x of items) {
-    const k = x.id || `${(x.name||"").toLowerCase()}|${x.address?.toLowerCase()||""}`;
-    if (!map.has(k)) map.set(k, x);
-  }
-  return [...map.values()];
+function dedupe(arr){
+  const m=new Map();
+  for (const x of arr){ const k=`${(x.name||"").toLowerCase()}|${(x.address||"").toLowerCase()}`; if(!m.has(k)) m.set(k,x); }
+  return [...m.values()];
 }
